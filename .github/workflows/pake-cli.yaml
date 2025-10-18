@@ -74,7 +74,6 @@ jobs:
         with:
           mode: build
 
-      # 🆕 macOS 专用：安装 DMG 打包工具
       - name: Install create-dmg (macOS only)
         if: runner.os == 'macOS'
         run: brew install create-dmg
@@ -94,13 +93,12 @@ jobs:
         run: |
           echo "Installing latest pake-cli..."
           pnpm install pake-cli@latest
-
-          # Verify installation
+          
           if [ ! -d "node_modules/pake-cli" ]; then
             echo "Error: Failed to install pake-cli"
             exit 1
           fi
-
+          
           echo "Listing pake-cli contents:"
           ls -la node_modules/pake-cli/ | head -5
           echo "pake-cli installation verified"
@@ -117,13 +115,16 @@ jobs:
             node_modules/pake-cli/src-tauri/target/
           key: ${{ inputs.platform }}-cargo-${{ hashFiles('node_modules/pake-cli/src-tauri/Cargo.lock') }}
 
-      # 🔄 修改：即使失败也继续
       - name: Build with pake-cli
         id: build
         timeout-minutes: 15
         continue-on-error: true
         run: |
+          echo "Starting build process..."
           node ./scripts/github-action-build.js
+          BUILD_EXIT_CODE=$?
+          echo "Build script exited with code: $BUILD_EXIT_CODE"
+          exit $BUILD_EXIT_CODE
         env:
           URL: ${{ inputs.url }}
           NAME: ${{ inputs.name }}
@@ -138,79 +139,203 @@ jobs:
           PKG_CONFIG_ALLOW_SYSTEM_LIBS: 1
           PKG_CONFIG_ALLOW_SYSTEM_CFLAGS: 1
 
-      # 🆕 macOS 专用：手动打包 DMG
+      # 🆕 关键调试步骤
+      - name: Debug - Search for build artifacts
+        if: always()
+        shell: bash
+        run: |
+          echo "========================================="
+          echo "🔍 DEBUGGING: Searching for build output"
+          echo "========================================="
+          echo ""
+          
+          echo "1️⃣ Searching for ALL .app bundles (no depth limit):"
+          find . -name "*.app" -type d 2>/dev/null | while read app; do
+            echo "  Found: $app"
+          done
+          
+          echo ""
+          echo "2️⃣ Searching for ALL .dmg files:"
+          find . -name "*.dmg" -type f 2>/dev/null | while read dmg; do
+            echo "  Found: $dmg"
+          done
+          
+          echo ""
+          echo "3️⃣ Checking pake-cli output directory:"
+          if [ -d "node_modules/pake-cli/output" ]; then
+            echo "  ✅ Output directory exists"
+            ls -lah node_modules/pake-cli/output/
+          else
+            echo "  ❌ Output directory does NOT exist"
+          fi
+          
+          echo ""
+          echo "4️⃣ Checking tauri target/release/bundle directory:"
+          if [ -d "node_modules/pake-cli/src-tauri/target" ]; then
+            find node_modules/pake-cli/src-tauri/target -type d -name "bundle" 2>/dev/null | while read bundle_dir; do
+              echo "  Bundle directory: $bundle_dir"
+              if [ -d "$bundle_dir" ]; then
+                echo "  Contents:"
+                ls -lah "$bundle_dir/" 2>/dev/null || echo "    (empty or inaccessible)"
+                
+                # Check subdirectories
+                for subdir in macos dmg; do
+                  if [ -d "$bundle_dir/$subdir" ]; then
+                    echo "  Contents of $subdir/:"
+                    ls -lah "$bundle_dir/$subdir/" 2>/dev/null || echo "    (empty)"
+                  fi
+                done
+              fi
+            done
+          else
+            echo "  ❌ Target directory does not exist"
+          fi
+          
+          echo ""
+          echo "5️⃣ Build step outcome:"
+          echo "  Build step result: ${{ steps.build.outcome }}"
+          echo "  Build step conclusion: ${{ steps.build.conclusion }}"
+          
+          echo ""
+          echo "6️⃣ Listing target architecture directories:"
+          if [ -d "node_modules/pake-cli/src-tauri/target" ]; then
+            ls -d node_modules/pake-cli/src-tauri/target/*/ 2>/dev/null | head -10
+          fi
+          
+          echo ""
+          echo "========================================="
+
       - name: Manual DMG packaging (macOS only)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          echo "Searching for .app bundle..."
+          echo "========================================="
+          echo "📦 Manual DMG Packaging"
+          echo "========================================="
+          echo ""
           
-          # 查找 .app 文件
-          APP_PATH=$(find node_modules/pake-cli/src-tauri/target -name "*.app" -type d | head -1)
+          # 扩大搜索范围，添加详细日志
+          echo "🔍 Method 1: Searching in target directory..."
+          APP_PATH=$(find node_modules/pake-cli/src-tauri/target -name "*.app" -type d 2>/dev/null | grep -v "deps" | head -1)
           
           if [ -z "$APP_PATH" ]; then
-            echo "❌ No .app bundle found!"
+            echo "  ❌ Not found in target directory"
+            
+            echo ""
+            echo "🔍 Method 2: Searching in entire pake-cli directory..."
+            APP_PATH=$(find node_modules/pake-cli -name "*.app" -type d 2>/dev/null | head -1)
+          fi
+          
+          if [ -z "$APP_PATH" ]; then
+            echo "  ❌ Not found in pake-cli directory"
+            
+            echo ""
+            echo "🔍 Method 3: Searching in current directory..."
+            APP_PATH=$(find . -name "*.app" -type d -maxdepth 5 2>/dev/null | head -1)
+          fi
+          
+          if [ -z "$APP_PATH" ]; then
+            echo ""
+            echo "❌❌❌ CRITICAL ERROR ❌❌❌"
+            echo "No .app bundle found after exhaustive search!"
+            echo ""
+            echo "This means the build FAILED. Common causes:"
+            echo "  1. Compilation errors (check 'Build with pake-cli' logs)"
+            echo "  2. Rust/Cargo dependency issues"
+            echo "  3. Network problems downloading dependencies"
+            echo "  4. Insufficient memory/resources"
+            echo ""
+            echo "⚠️ Please check the 'Build with pake-cli' step for error messages."
+            echo "========================================="
             exit 1
           fi
           
-          echo "✅ Found app at: $APP_PATH"
+          echo "✅ Found .app bundle at: $APP_PATH"
+          APP_NAME=$(basename "$APP_PATH" .app)
+          echo "📱 App name: $APP_NAME"
           
-          # 确保 output 目录存在
+          # 创建 output 目录
           mkdir -p node_modules/pake-cli/output
+          echo "✅ Output directory ready"
           
-          # 尝试查找现有的 DMG
-          EXISTING_DMG=$(find node_modules/pake-cli/src-tauri/target -name "*.dmg" | head -1)
+          # 检查现有 DMG
+          echo ""
+          echo "🔍 Looking for existing DMG files..."
+          EXISTING_DMG=$(find node_modules/pake-cli/src-tauri/target -name "*.dmg" -type f 2>/dev/null | head -1)
           
           if [ -n "$EXISTING_DMG" ]; then
-            echo "✅ DMG already exists: $EXISTING_DMG"
-            cp "$EXISTING_DMG" node_modules/pake-cli/output/
+            echo "✅ Found existing DMG: $EXISTING_DMG"
+            cp "$EXISTING_DMG" "node_modules/pake-cli/output/"
+            echo "✅ Copied DMG to output directory"
           else
-            echo "📦 Creating DMG manually..."
+            echo "ℹ️ No existing DMG found, will create new one"
             
-            # 创建 DMG
-            create-dmg \
-              --volname "${{ inputs.name }}" \
+            echo ""
+            echo "📦 Creating DMG with create-dmg..."
+            OUTPUT_DMG="node_modules/pake-cli/output/${APP_NAME}.dmg"
+            
+            if create-dmg \
+              --volname "$APP_NAME" \
               --window-pos 200 120 \
               --window-size 800 400 \
               --icon-size 100 \
               --app-drop-link 600 185 \
-              "node_modules/pake-cli/output/${{ inputs.name }}.dmg" \
-              "$APP_PATH" || {
-                echo "⚠️ DMG creation failed, creating zip instead"
-                cd "$(dirname "$APP_PATH")"
-                zip -r "${{ inputs.name }}.app.zip" "$(basename "$APP_PATH")"
-                mv "${{ inputs.name }}.app.zip" "$GITHUB_WORKSPACE/node_modules/pake-cli/output/"
-              }
+              "$OUTPUT_DMG" \
+              "$APP_PATH" 2>&1; then
+              echo "✅ DMG created successfully!"
+            else
+              DMG_EXIT_CODE=$?
+              echo "⚠️ DMG creation failed with exit code: $DMG_EXIT_CODE"
+              echo "This is OK - we'll package as ZIP instead"
+            fi
           fi
           
-          # 同时也打包 .app 作为备份
-          echo "📦 Creating .app.zip as backup..."
+          # 创建 ZIP 备份
+          echo ""
+          echo "📦 Creating .app.zip as backup/alternative..."
           cd "$(dirname "$APP_PATH")"
-          zip -r "${{ inputs.name }}.app.zip" "$(basename "$APP_PATH")"
-          mv "${{ inputs.name }}.app.zip" "$GITHUB_WORKSPACE/node_modules/pake-cli/output/"
+          APP_BASENAME=$(basename "$APP_PATH")
           
-          # 列出 output 目录内容
-          echo "📁 Output directory contents:"
+          if zip -r "${APP_NAME}.app.zip" "$APP_BASENAME"; then
+            mv "${APP_NAME}.app.zip" "$GITHUB_WORKSPACE/node_modules/pake-cli/output/"
+            echo "✅ ZIP created and moved to output directory"
+          else
+            echo "❌ Failed to create ZIP"
+          fi
+          
+          # 显示最终结果
+          echo ""
+          echo "📁 Final output directory contents:"
           ls -lh "$GITHUB_WORKSPACE/node_modules/pake-cli/output/"
+          
+          echo ""
+          echo "========================================="
+          echo "✅ Packaging process completed!"
+          echo "========================================="
 
-      # 🔄 修改：检查是否有输出文件
       - name: Verify output
         shell: bash
         run: |
-          if [ -d "node_modules/pake-cli/output" ]; then
-            echo "Output directory contents:"
-            ls -lh node_modules/pake-cli/output/
-            
-            FILE_COUNT=$(ls -1 node_modules/pake-cli/output/ 2>/dev/null | wc -l)
-            if [ "$FILE_COUNT" -eq 0 ]; then
-              echo "❌ No output files found!"
-              exit 1
-            fi
-            echo "✅ Found $FILE_COUNT output file(s)"
-          else
-            echo "❌ Output directory not found!"
+          echo "Verifying build output..."
+          
+          if [ ! -d "node_modules/pake-cli/output" ]; then
+            echo "❌ Output directory does not exist!"
+            echo "Build failed. Check previous steps for errors."
             exit 1
           fi
+          
+          echo "Output directory contents:"
+          ls -lh node_modules/pake-cli/output/
+          
+          FILE_COUNT=$(ls -1 node_modules/pake-cli/output/ 2>/dev/null | wc -l)
+          
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "❌ No output files found!"
+            echo "Build failed. Check 'Build with pake-cli' and debug steps."
+            exit 1
+          fi
+          
+          echo "✅ Found $FILE_COUNT output file(s)"
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
