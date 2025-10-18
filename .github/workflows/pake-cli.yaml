@@ -74,6 +74,11 @@ jobs:
         with:
           mode: build
 
+      # 🆕 macOS 专用：安装 DMG 打包工具
+      - name: Install create-dmg (macOS only)
+        if: runner.os == 'macOS'
+        run: brew install create-dmg
+
       - name: Cache Node dependencies
         uses: actions/cache@v4
         with:
@@ -112,8 +117,11 @@ jobs:
             node_modules/pake-cli/src-tauri/target/
           key: ${{ inputs.platform }}-cargo-${{ hashFiles('node_modules/pake-cli/src-tauri/Cargo.lock') }}
 
+      # 🔄 修改：即使失败也继续
       - name: Build with pake-cli
+        id: build
         timeout-minutes: 15
+        continue-on-error: true
         run: |
           node ./scripts/github-action-build.js
         env:
@@ -129,6 +137,80 @@ jobs:
           PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig
           PKG_CONFIG_ALLOW_SYSTEM_LIBS: 1
           PKG_CONFIG_ALLOW_SYSTEM_CFLAGS: 1
+
+      # 🆕 macOS 专用：手动打包 DMG
+      - name: Manual DMG packaging (macOS only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          echo "Searching for .app bundle..."
+          
+          # 查找 .app 文件
+          APP_PATH=$(find node_modules/pake-cli/src-tauri/target -name "*.app" -type d | head -1)
+          
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ No .app bundle found!"
+            exit 1
+          fi
+          
+          echo "✅ Found app at: $APP_PATH"
+          
+          # 确保 output 目录存在
+          mkdir -p node_modules/pake-cli/output
+          
+          # 尝试查找现有的 DMG
+          EXISTING_DMG=$(find node_modules/pake-cli/src-tauri/target -name "*.dmg" | head -1)
+          
+          if [ -n "$EXISTING_DMG" ]; then
+            echo "✅ DMG already exists: $EXISTING_DMG"
+            cp "$EXISTING_DMG" node_modules/pake-cli/output/
+          else
+            echo "📦 Creating DMG manually..."
+            
+            # 创建 DMG
+            create-dmg \
+              --volname "${{ inputs.name }}" \
+              --window-pos 200 120 \
+              --window-size 800 400 \
+              --icon-size 100 \
+              --app-drop-link 600 185 \
+              "node_modules/pake-cli/output/${{ inputs.name }}.dmg" \
+              "$APP_PATH" || {
+                echo "⚠️ DMG creation failed, creating zip instead"
+                cd "$(dirname "$APP_PATH")"
+                zip -r "${{ inputs.name }}.app.zip" "$(basename "$APP_PATH")"
+                mv "${{ inputs.name }}.app.zip" "$GITHUB_WORKSPACE/node_modules/pake-cli/output/"
+              }
+          fi
+          
+          # 同时也打包 .app 作为备份
+          echo "📦 Creating .app.zip as backup..."
+          cd "$(dirname "$APP_PATH")"
+          zip -r "${{ inputs.name }}.app.zip" "$(basename "$APP_PATH")"
+          mv "${{ inputs.name }}.app.zip" "$GITHUB_WORKSPACE/node_modules/pake-cli/output/"
+          
+          # 列出 output 目录内容
+          echo "📁 Output directory contents:"
+          ls -lh "$GITHUB_WORKSPACE/node_modules/pake-cli/output/"
+
+      # 🔄 修改：检查是否有输出文件
+      - name: Verify output
+        shell: bash
+        run: |
+          if [ -d "node_modules/pake-cli/output" ]; then
+            echo "Output directory contents:"
+            ls -lh node_modules/pake-cli/output/
+            
+            FILE_COUNT=$(ls -1 node_modules/pake-cli/output/ 2>/dev/null | wc -l)
+            if [ "$FILE_COUNT" -eq 0 ]; then
+              echo "❌ No output files found!"
+              exit 1
+            fi
+            echo "✅ Found $FILE_COUNT output file(s)"
+          else
+            echo "❌ Output directory not found!"
+            exit 1
+          fi
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
